@@ -24,7 +24,7 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: QuickAdd (latest build)
+          tag_name: build-${{ github.run_number }}
+          name: QuickAdd build ${{ github.run_number }}
           files: QuickAdd.zip
           make_latest: true

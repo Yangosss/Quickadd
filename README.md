@@ -3,7 +3,13 @@
 Floating quick-add box for Apple Reminders. Press **⌘⇧C** and a Spotlight-style
 box opens next to your cursor and follows it.
 
-## Build and install
+## Download
+
+https://github.com/Yangosss/Quickadd/releases/latest/download/QuickAdd.zip
+
+Unzip, drag to Applications, right-click → Open the first time.
+
+## Build from source
 
 Requires macOS 13+ and Xcode Command Line Tools (`xcode-select --install`).
 
