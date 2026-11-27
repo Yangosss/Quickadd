@@ -1,5 +1,5 @@
 // QuickAdd — floating, mouse-following quick-add box for Apple Reminders.
-// Hotkey: ⌘⇧C  ·  Enter: add  ·  ⇧Enter: add & keep open  ·  Esc: close
+// Hotkeys: ⌘⇧C new reminder · ⌘⇧X text from screen (OCR)  ·  Enter: add  ·  ⇧Enter: add & keep open  ·  Esc: close
 //
 // Syntax (Todoist-style):
 //   tod / tom / mon / next fri / tom evening / 6pm / in 20 min / eom → due date (+ alert)
@@ -11,13 +11,17 @@
 import AppKit
 import Carbon.HIToolbox
 import EventKit
+import ImageIO
 import ServiceManagement
+import Vision
 
 // MARK: - Config
 
 enum Config {
     static let hotKeyCode = UInt32(kVK_ANSI_C)          // change key here
     static let hotKeyMods = UInt32(cmdKey | shiftKey)   // change modifiers here
+    static let ocrKeyCode = UInt32(kVK_ANSI_X)          // ⌘⇧X: text from screen
+    static let ocrLanguages = ["en-US", "zh-Hant"]      // OCR languages, in priority order
     static let size = NSSize(width: 480, height: 78)
     static let mouseOffset: CGFloat = 18
     static let followSmoothing: CGFloat = 0.35          // 1 = snap, lower = smoother
@@ -118,6 +122,9 @@ enum Parser {
     private static let tomorrowWord = #"(?:tomorrow|tmrw?|(?-i:tom))"#
     private static let every = #"(?:every|(?-i:ev))"#
     private static let weekdayWord = #"(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)s?"#
+    private static let monthWord = #"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?"#
+    private static let monthNumber = ["jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+                                      "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12]
     private static let weekdayNumber = ["su": 1, "mo": 2, "tu": 3, "we": 4, "th": 5, "fr": 6, "sa": 7]
     private static let periodTime = ["morning": (9, 0), "afternoon": (12, 0), "evening": (19, 0), "night": (22, 0)]
 
@@ -242,6 +249,20 @@ enum Parser {
             w.time = (pt.0, pt.1)
         }
 
+        // Explicit dates win over bare weekdays: "Friday 24 September", "24 sep 2027", "Sep 24th"
+        if w.day == nil, w.exact == nil {
+            let wdPrefix = #"(?:"# + weekdayWord + #",?\s+)?"#
+            let ord = #"(\d{1,2})(?:st|nd|rd|th)?"#
+            let yr = #"(?:,?\s+(\d{4}))?"#
+            if let m = take(#"\s(?:on\s+)?"# + wdPrefix + ord + #"\s+(?:of\s+)?("# + monthWord + ")" + yr + #"(?=\s)"#),
+               let d = m.groups[0].flatMap({ Int($0) }), let mo = m.groups[1] {
+                w.day = explicitDate(day: d, month: mo, year: m.groups[2].flatMap { Int($0) })
+            } else if let m = take(#"\s(?:on\s+)?"# + wdPrefix + "(" + monthWord + #")\s+"# + ord + yr + #"(?=\s)"#),
+                      let mo = m.groups[0], let d = m.groups[1].flatMap({ Int($0) }) {
+                w.day = explicitDate(day: d, month: mo, year: m.groups[2].flatMap { Int($0) })
+            }
+        }
+
         // Day keywords
         if w.day == nil, w.exact == nil {
             if take(#"\s"# + todayWord + #"(?=\s)"#) != nil {
@@ -335,6 +356,16 @@ enum Parser {
             }
         }
         return nil
+    }
+
+    /// "24 sep" → the next 24 Sep (this year, or next year if already passed).
+    private static func explicitDate(day: Int, month: String, year: Int?) -> Date? {
+        guard let mo = monthNumber[String(month.lowercased().prefix(3))], (1...31).contains(day) else { return nil }
+        let today = cal.startOfDay(for: Date())
+        let y = year ?? cal.component(.year, from: today)
+        guard var d = cal.date(from: DateComponents(year: y, month: mo, day: day)) else { return nil }
+        if year == nil, d < today, let next = cal.date(byAdding: .year, value: 1, to: d) { d = next }
+        return d
     }
 
     private static func nextWeekday(_ wd: Int, includeToday: Bool) -> Date {
@@ -525,22 +556,32 @@ final class ReminderStore {
 
 // MARK: - Global hotkey (Carbon — no Accessibility permission needed)
 
-final class HotKey {
-    private var ref: EventHotKeyRef?
-    private var handlerRef: EventHandlerRef?
-    static var action: (() -> Void)?
+enum HotKeys {
+    private static var actions: [UInt32: () -> Void] = [:]
+    private static var installed = false
+    private static var refs: [EventHotKeyRef] = []
 
-    /// Returns nil if the shortcut is already taken by another app.
-    init?(keyCode: UInt32, modifiers: UInt32, action: @escaping () -> Void) {
-        HotKey.action = action
-        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-            DispatchQueue.main.async { HotKey.action?() }
-            return noErr
-        }, 1, &spec, nil, &handlerRef)
-        let id = EventHotKeyID(signature: OSType(0x5141_4444), id: 1) // 'QADD'
-        let status = RegisterEventHotKey(keyCode, modifiers, id, GetApplicationEventTarget(), 0, &ref)
-        if status != noErr { return nil }
+    /// Returns false if the shortcut is already taken by another app.
+    @discardableResult
+    static func register(id: UInt32, keyCode: UInt32, modifiers: UInt32, action: @escaping () -> Void) -> Bool {
+        if !installed {
+            var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+            InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+                var hk = EventHotKeyID()
+                GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                                  nil, MemoryLayout<EventHotKeyID>.size, nil, &hk)
+                let id = hk.id
+                DispatchQueue.main.async { HotKeys.actions[id]?() }
+                return noErr
+            }, 1, &spec, nil, nil)
+            installed = true
+        }
+        actions[id] = action
+        var ref: EventHotKeyRef?
+        let hkID = EventHotKeyID(signature: OSType(0x5141_4444), id: id) // 'QADD'
+        let status = RegisterEventHotKey(keyCode, modifiers, hkID, GetApplicationEventTarget(), 0, &ref)
+        if let ref { refs.append(ref) }
+        return status == noErr
     }
 }
 
@@ -555,7 +596,6 @@ final class FloatingPanel: NSPanel {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowDelegate {
     private let store = ReminderStore()
-    private var hotKey: HotKey?
     private var statusItem: NSStatusItem!
     private var panel: FloatingPanel!
     private let field = NSTextField()
@@ -575,8 +615,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         buildStatusItem()
         buildPanel()
         store.requestAccess { _ in }
-        hotKey = HotKey(keyCode: Config.hotKeyCode, modifiers: Config.hotKeyMods) { [weak self] in self?.toggle() }
-        if hotKey == nil { alert("⌘⇧C is already used by another app. Change it in Config (main.swift).") }
+        if !HotKeys.register(id: 1, keyCode: Config.hotKeyCode, modifiers: Config.hotKeyMods, action: { [weak self] in self?.toggle() }) {
+            alert("⌘⇧C is already used by another app. Change it in Config (main.swift).")
+        }
+        if !HotKeys.register(id: 2, keyCode: Config.ocrKeyCode, modifiers: Config.hotKeyMods, action: { [weak self] in self?.captureText() }) {
+            alert("⌘⇧X is already used by another app. Change it in Config (main.swift).")
+        }
     }
 
     // Hidden main menu so ⌘C/⌘V/⌘X/⌘A/⌘Z work inside the text field.
@@ -605,6 +649,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let newItem = NSMenuItem(title: "New Reminder", action: #selector(showFromMenu), keyEquivalent: "c")
         newItem.keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(newItem)
+        let ocrItem = NSMenuItem(title: "Text from Screen", action: #selector(captureFromMenu), keyEquivalent: "x")
+        ocrItem.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(ocrItem)
         menu.addItem(.separator())
 
         let follow = NSMenuItem(title: "Follow Mouse", action: #selector(toggleFollow(_:)), keyEquivalent: "")
@@ -673,16 +720,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     private func toggle() { panel.isVisible ? hide() : show() }
     @objc private func showFromMenu() { show() }
+    @objc private func captureFromMenu() { captureText() }
 
-    private func show() {
-        field.stringValue = ""
+    private func show(prefill: String = "") {
+        field.stringValue = prefill
         updatePreview()
         panel.setFrameOrigin(targetOrigin())
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(field)
+        // cursor at the end so you can add "tom 3pm #Work"
+        field.currentEditor()?.selectedRange = NSRange(location: (prefill as NSString).length, length: 0)
         panel.invalidateShadow()
         startFollowing()
+    }
+
+    // MARK: Text from screen (⌘⇧X)
+
+    /// Uses macOS's own screenshot selector, then on-device Vision OCR. Nothing runs until you press ⌘⇧X.
+    private func captureText() {
+        hide()
+        guard CGPreflightScreenCaptureAccess() else {
+            _ = CGRequestScreenCaptureAccess()
+            alert("To read text from the screen, turn on QuickAdd in System Settings › Privacy & Security › Screen & System Audio Recording, then quit and reopen QuickAdd.")
+            return
+        }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("quickadd-ocr.png")
+        try? FileManager.default.removeItem(at: url)
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        proc.arguments = ["-i", "-x", url.path]  // -i: drag to select (Esc cancels), -x: no sound
+        proc.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async { self?.recognizeText(at: url) }
+        }
+        do { try proc.run() } catch { alert("Couldn't start screen capture: \(error.localizedDescription)") }
+    }
+
+    private func recognizeText(at url: URL) {
+        defer { try? FileManager.default.removeItem(at: url) }
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return } // cancelled
+
+        let request = VNRecognizeTextRequest { [weak self] req, _ in
+            let obs = (req.results as? [VNRecognizedTextObservation]) ?? []
+            // top-to-bottom, then left-to-right (Vision's origin is bottom-left)
+            let sorted = obs.sorted {
+                abs($0.boundingBox.midY - $1.boundingBox.midY) > 0.01
+                    ? $0.boundingBox.midY > $1.boundingBox.midY
+                    : $0.boundingBox.minX < $1.boundingBox.minX
+            }
+            let text = sorted.compactMap { $0.topCandidates(1).first?.string }
+                .joined(separator: " ")
+                .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespaces)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if text.isEmpty { NSSound.beep(); return }
+                self.show(prefill: text)
+            }
+        }
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+        request.recognitionLanguages = Config.ocrLanguages
+        DispatchQueue.global(qos: .userInitiated).async {
+            try? VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+        }
     }
 
     private func hide() {

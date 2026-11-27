@@ -26,6 +26,7 @@ Click **Allow** when it asks for Reminders access.
 | Key        | Action                  |
 |------------|-------------------------|
 | `⌘⇧C`      | Open / close            |
+| `⌘⇧X`      | Text from screen: drag over any text, it fills the box |
 | `↩`        | Add and close           |
 | `⇧↩`       | Add and keep open       |
 | `esc`      | Close                   |
@@ -36,6 +37,7 @@ Todoist-style. Shortcuts are lowercase only, so `call Tom` stays a name.
 
 | Type | Examples |
 |---|---|
+| Date | `Friday 24 September`, `24 sep 2027`, `Sep 24th`, `3rd of march` (no year → next upcoming) |
 | Day | `tod`, `tom`, `mon`…`sun`, `next fri`, `next week`, `next month`, `next year`, `this weekend`, `next weekend`, `eom`, `jan 27`, `27/1` |
 | Time | `3pm`, `3:30pm`, `15:00`, `at 10`, `noon`, `tonight`, `tom morning`, `tod evening`, `in the afternoon` |
 | Relative | `in 20 min`, `in 2 hours`, `in 5 days`, `+3 weeks`, `in 2 months` |
@@ -61,6 +63,16 @@ Rules:
 - A repeat with no date starts today, or on the next matching day.
 - Unknown `#List` → saved to your default list (the preview warns you).
 - Not supported (Reminders can't do them): `every!` (repeat from completion), hourly repeats.
+
+## Text from screen (⌘⇧X)
+
+Drag a box over any text (web page, PDF, image). It's read on your Mac with
+Apple's Vision OCR and put in the box, cursor at the end. Dates in it are
+picked up as usual; add `tom 3pm`, `#List` etc. and press ↩. `Esc` cancels.
+
+- First use: allow QuickAdd in System Settings › Privacy & Security ›
+  Screen & System Audio Recording, then quit and reopen QuickAdd.
+- Languages: English and Traditional Chinese (`ocrLanguages` in `Config`).
 
 ## Menu bar
 
