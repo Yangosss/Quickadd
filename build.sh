@@ -14,6 +14,7 @@ done
 lipo -create build/QuickAdd-arm64 build/QuickAdd-x86_64 -output "$APP/Contents/MacOS/QuickAdd"
 rm build/QuickAdd-arm64 build/QuickAdd-x86_64
 
+strip -x "$APP/Contents/MacOS/QuickAdd"
 cp Info.plist "$APP/Contents/Info.plist"
 codesign --force --sign - "$APP"
 echo "Built $APP"

@@ -5,6 +5,7 @@
 //   tomorrow 3pm / next fri / in 20 min   → due date (+ alert)
 //   #Work  #Shopping_List                  → list (underscore = space, prefix match OK)
 //   !!! / !! / !   or  p1 / p2 / p3        → priority high / medium / low
+//   daily / every mon, wed / every 2 weeks / every weekday / monthly → repeat
 
 import AppKit
 import Carbon.HIToolbox
@@ -30,6 +31,40 @@ struct ParsedReminder {
     var hasTime = false
     var list: String?
     var priority = 0  // EventKit: 0 none, 1 high, 5 medium, 9 low
+    var repeatRule: Repeat?
+}
+
+struct Repeat {
+    var frequency: EKRecurrenceFrequency
+    var interval = 1
+    var weekdays: [Int] = []  // Calendar weekday numbers: 1 = Sun … 7 = Sat
+
+    private static let dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+    var label: String {
+        if !weekdays.isEmpty {
+            if weekdays == [2, 3, 4, 5, 6] { return "Every weekday" }
+            if weekdays == [1, 7] { return "Every weekend" }
+            return "Every " + weekdays.map { Repeat.dayNames[$0 - 1] }.joined(separator: ", ")
+        }
+        let unit: String
+        switch frequency {
+        case .daily: unit = "day"
+        case .weekly: unit = "week"
+        case .monthly: unit = "month"
+        default: unit = "year"
+        }
+        if interval == 1 { return ["day": "Daily", "week": "Weekly", "month": "Monthly", "year": "Yearly"][unit]! }
+        return "Every \(interval) \(unit)s"
+    }
+
+    var rule: EKRecurrenceRule {
+        let days = weekdays.compactMap { EKWeekday(rawValue: $0) }.map { EKRecurrenceDayOfWeek($0) }
+        return EKRecurrenceRule(recurrenceWith: frequency, interval: interval,
+                                daysOfTheWeek: days.isEmpty ? nil : days,
+                                daysOfTheMonth: nil, monthsOfTheYear: nil, weeksOfTheYear: nil,
+                                daysOfTheYear: nil, setPositions: nil, end: nil)
+    }
 }
 
 enum Parser {
@@ -56,6 +91,12 @@ enum Parser {
             text.replaceSubrange(m.whole, with: " ")
         }
 
+        // Repeat (parsed before dates so "every mon" isn't read as a one-off date)
+        if let (rep, range) = parseRepeat(text) {
+            p.repeatRule = rep
+            text.replaceSubrange(range, with: " ")
+        }
+
         // "in 20 min" / "in 2 hours" / "in 3 days"
         if let m = match(#"\sin\s+(\d+)\s*(minutes?|mins?|m|hours?|hrs?|h|days?|d)(?=\s)"#, in: text),
            let gn = m.groups[0], let gu = m.groups[1], let n = Double(text[gn]) {
@@ -80,11 +121,80 @@ enum Parser {
             text.replaceSubrange(r, with: " ")
         }
 
+        // Repeats need a due date: default to today, and snap to the next matching weekday.
+        if let rep = p.repeatRule {
+            var due = p.due ?? Date()
+            if !rep.weekdays.isEmpty {
+                due = nextMatching(due, weekdays: rep.weekdays)
+                if p.hasTime, due < Date() {
+                    due = nextMatching(due.addingTimeInterval(86400), weekdays: rep.weekdays)
+                }
+            }
+            p.due = due
+        }
+
         p.title = text
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespaces)
             .replacingOccurrences(of: #"\s+(at|on|by|due)$"#, with: "", options: [.regularExpression, .caseInsensitive])
         return p
+    }
+
+    private static let weekdayWord = #"(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)s?"#
+
+    private static func parseRepeat(_ text: String) -> (Repeat, Range<String.Index>)? {
+        // daily / every day
+        if let m = match(#"\s(?:daily|every\s+day)(?=\s)"#, in: text) {
+            return (Repeat(frequency: .daily), m.whole)
+        }
+        // every weekday / every weekend
+        if let m = match(#"\severy\s+weekdays?(?=\s)"#, in: text) {
+            return (Repeat(frequency: .weekly, weekdays: [2, 3, 4, 5, 6]), m.whole)
+        }
+        if let m = match(#"\severy\s+weekends?(?=\s)"#, in: text) {
+            return (Repeat(frequency: .weekly, weekdays: [1, 7]), m.whole)
+        }
+        // every 2 weeks / every other month
+        if let m = match(#"\severy\s+(\d+|other)\s+(days?|weeks?|months?|years?)(?=\s)"#, in: text),
+           let gn = m.groups[0], let gu = m.groups[1] {
+            let n = text[gn].lowercased() == "other" ? 2 : max(Int(text[gn]) ?? 1, 1)
+            return (Repeat(frequency: frequency(String(text[gu])), interval: n), m.whole)
+        }
+        // weekly / monthly / yearly / every week / every month / every year
+        if let m = match(#"\s(?:(weekly|monthly|yearly|annually)|every\s+(week|month|year))(?=\s)"#, in: text) {
+            let word = (m.groups[0] ?? m.groups[1]).map { String(text[$0]) } ?? "week"
+            return (Repeat(frequency: frequency(word)), m.whole)
+        }
+        // every mon / every mon, wed and fri
+        let list = #"\severy\s+("# + weekdayWord + #"(?:\s*(?:,|and|&)\s*"# + weekdayWord + #")*)(?=\s)"#
+        if let m = match(list, in: text), let g = m.groups[0] {
+            let order = ["su": 1, "mo": 2, "tu": 3, "we": 4, "th": 5, "fr": 6, "sa": 7]
+            let days = text[g].lowercased()
+                .components(separatedBy: CharacterSet.letters.inverted)
+                .filter { $0.count >= 3 && $0 != "and" }
+                .compactMap { order[String($0.prefix(2))] }
+            if !days.isEmpty {
+                return (Repeat(frequency: .weekly, weekdays: Array(Set(days)).sorted()), m.whole)
+            }
+        }
+        return nil
+    }
+
+    private static func frequency(_ word: String) -> EKRecurrenceFrequency {
+        let w = word.lowercased()
+        if w.hasPrefix("day") || w == "daily" { return .daily }
+        if w.hasPrefix("month") { return .monthly }
+        if w.hasPrefix("year") || w == "annually" { return .yearly }
+        return .weekly
+    }
+
+    private static func nextMatching(_ date: Date, weekdays: [Int]) -> Date {
+        let cal = Calendar.current
+        for i in 0..<7 {
+            if let d = cal.date(byAdding: .day, value: i, to: date),
+               weekdays.contains(cal.component(.weekday, from: d)) { return d }
+        }
+        return date
     }
 
     private static func match(_ pattern: String, in text: String)
@@ -107,10 +217,24 @@ struct QuickAddError: LocalizedError {
 final class ReminderStore {
     private let store = EKEventStore()
     private(set) var granted = false
+    private var cachedLists: [EKCalendar]?  // refreshed only when Reminders data changes
+
+    init() {
+        NotificationCenter.default.addObserver(forName: .EKEventStoreChanged, object: store, queue: .main) { [weak self] _ in
+            self?.cachedLists = nil
+        }
+    }
+
+    private var lists: [EKCalendar] {
+        if let c = cachedLists { return c }
+        let c = store.calendars(for: .reminder)
+        cachedLists = c
+        return c
+    }
 
     func requestAccess(_ done: @escaping (Bool) -> Void) {
         let handler: (Bool, Error?) -> Void = { ok, _ in
-            DispatchQueue.main.async { self.granted = ok; done(ok) }
+            DispatchQueue.main.async { self.granted = ok; self.cachedLists = nil; done(ok) }
         }
         if #available(macOS 14.0, *) {
             store.requestFullAccessToReminders(completion: handler)
@@ -123,7 +247,7 @@ final class ReminderStore {
     func list(named name: String?) -> EKCalendar? {
         guard let name, !name.isEmpty else { return nil }
         let n = name.lowercased()
-        let cals = store.calendars(for: .reminder)
+        let cals = lists
         return cals.first { $0.title.lowercased() == n } ?? cals.first { $0.title.lowercased().hasPrefix(n) }
     }
 
@@ -146,6 +270,7 @@ final class ReminderStore {
                 : Calendar.current.date(bySettingHour: Config.allDayAlertHour, minute: 0, second: 0, of: due) ?? due
             r.addAlarm(EKAlarm(absoluteDate: alertDate))
         }
+        if let rep = p.repeatRule { r.addRecurrenceRule(rep.rule) }
         try store.save(r, commit: true)
         return cal.title
     }
@@ -387,7 +512,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             return
         }
         guard !p.title.isEmpty || p.due != nil else {
-            preview.stringValue = "tomorrow 3pm  ·  #List  ·  !!!  —  ↩ add   ⇧↩ add another   esc close"
+            preview.stringValue = "tomorrow 3pm  ·  every mon  ·  #List  ·  !!!  —  ↩ add   ⇧↩ add another   esc close"
             return
         }
         var parts: [String] = []
@@ -407,6 +532,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         case 9: parts.append("⚑ Low")
         default: break
         }
+        if let rep = p.repeatRule { parts.append("🔁 \(rep.label)") }
         preview.stringValue = parts.joined(separator: "   ")
     }
 

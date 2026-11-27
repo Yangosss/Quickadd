@@ -31,10 +31,16 @@ Click **Allow** when it asks for Reminders access.
 | Date / time        | `tomorrow 3pm`, `next fri`, `in 20 min` |
 | List               | `#Work`, `#Shopping_List` (`_` = space; prefix match works) |
 | Priority           | `!!!` / `!!` / `!` or `p1` / `p2` / `p3` |
+| Repeat             | `daily`, `weekly`, `monthly`, `yearly`, `every mon, wed and fri`, `every weekday`, `every 2 weeks`, `every other month` |
 
-Example: `email POSCO re offer fri 10am #Work !!!`
+Examples:
+
+- `email POSCO re offer fri 10am #Work !!!`
+- `gym every mon, wed and fri 7am`
+- `pay rent monthly #Home`
 
 - Date with no time → all-day reminder, alert at 09:00.
+- A repeat with no date starts today (or the next matching weekday).
 - Unknown `#List` → saved to your default list (the preview warns you).
 
 ## Menu bar
