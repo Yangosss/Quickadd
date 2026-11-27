@@ -2,10 +2,11 @@
 // Hotkey: ⌘⇧C  ·  Enter: add  ·  ⇧Enter: add & keep open  ·  Esc: close
 //
 // Syntax (Todoist-style):
-//   tomorrow 3pm / next fri / in 20 min   → due date (+ alert)
+//   tod / tom / mon / next fri / tom evening / 6pm / in 20 min / eom → due date (+ alert)
 //   #Work  #Shopping_List                  → list (underscore = space, prefix match OK)
-//   !!! / !! / !   or  p1 / p2 / p3        → priority high / medium / low
-//   daily / every mon, wed / every 2 weeks / every weekday / monthly → repeat
+//   !!! / !! / !   or  p1 / p2 / p3 (p4 = none) → priority high / medium / low
+//   daily / ev mon, wed / every 2 weeks / every workday / every 27th / every evening
+//   … until 31 dec / for 10 times / starting jan 3                       → repeat
 
 import AppKit
 import Carbon.HIToolbox
@@ -37,39 +38,88 @@ struct ParsedReminder {
 struct Repeat {
     var frequency: EKRecurrenceFrequency
     var interval = 1
-    var weekdays: [Int] = []  // Calendar weekday numbers: 1 = Sun … 7 = Sat
+    var weekdays: [Int] = []   // Calendar weekday numbers: 1 = Sun … 7 = Sat
+    var monthDays: [Int] = []  // 1…31, -1 = last day of month
+    var endDate: Date?
+    var count: Int?
 
     private static let dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    private static let shortDate: DateFormatter = {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("d MMM")
+        return f
+    }()
 
     var label: String {
+        var s: String
         if !weekdays.isEmpty {
-            if weekdays == [2, 3, 4, 5, 6] { return "Every weekday" }
-            if weekdays == [1, 7] { return "Every weekend" }
-            return "Every " + weekdays.map { Repeat.dayNames[$0 - 1] }.joined(separator: ", ")
+            if weekdays == [2, 3, 4, 5, 6] { s = "Every weekday" }
+            else if weekdays == [1, 7] { s = "Every weekend" }
+            else { s = "Every " + weekdays.map { Repeat.dayNames[$0 - 1] }.joined(separator: ", ") }
+        } else if !monthDays.isEmpty {
+            s = "Monthly on " + monthDays.map { $0 == -1 ? "last day" : Repeat.ordinal($0) }.joined(separator: ", ")
+        } else {
+            let unit: String
+            switch frequency {
+            case .daily: unit = "day"
+            case .weekly: unit = "week"
+            case .monthly: unit = "month"
+            default: unit = "year"
+            }
+            s = interval == 1
+                ? ["day": "Daily", "week": "Weekly", "month": "Monthly", "year": "Yearly"][unit]!
+                : "Every \(interval) \(unit)s"
         }
-        let unit: String
-        switch frequency {
-        case .daily: unit = "day"
-        case .weekly: unit = "week"
-        case .monthly: unit = "month"
-        default: unit = "year"
+        if let endDate { s += " until \(Repeat.shortDate.string(from: endDate))" }
+        if let count { s += " × \(count)" }
+        return s
+    }
+
+    static func ordinal(_ n: Int) -> String {
+        let suffix: String
+        switch (n % 100, n % 10) {
+        case (11...13, _): suffix = "th"
+        case (_, 1): suffix = "st"
+        case (_, 2): suffix = "nd"
+        case (_, 3): suffix = "rd"
+        default: suffix = "th"
         }
-        if interval == 1 { return ["day": "Daily", "week": "Weekly", "month": "Monthly", "year": "Yearly"][unit]! }
-        return "Every \(interval) \(unit)s"
+        return "\(n)\(suffix)"
     }
 
     var rule: EKRecurrenceRule {
         let days = weekdays.compactMap { EKWeekday(rawValue: $0) }.map { EKRecurrenceDayOfWeek($0) }
+        let end: EKRecurrenceEnd? = endDate.map { EKRecurrenceEnd(end: $0) }
+            ?? count.map { EKRecurrenceEnd(occurrenceCount: $0) }
         return EKRecurrenceRule(recurrenceWith: frequency, interval: interval,
                                 daysOfTheWeek: days.isEmpty ? nil : days,
-                                daysOfTheMonth: nil, monthsOfTheYear: nil, weeksOfTheYear: nil,
-                                daysOfTheYear: nil, setPositions: nil, end: nil)
+                                daysOfTheMonth: monthDays.isEmpty ? nil : monthDays.map { NSNumber(value: $0) },
+                                monthsOfTheYear: nil, weeksOfTheYear: nil,
+                                daysOfTheYear: nil, setPositions: nil, end: end)
     }
+}
+
+/// Date/time pieces found in the text. `exact` is used for "in 20 min" style times.
+struct When {
+    var day: Date?
+    var time: (h: Int, m: Int)?
+    var exact: Date?
+    var rest: String
+    var isEmpty: Bool { day == nil && time == nil && exact == nil }
 }
 
 enum Parser {
     private static let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue)
     private static let timeHint = #"\d{1,2}(:\d{2})?\s*(am|pm)\b|\b\d{1,2}:\d{2}\b|\b(noon|midnight|morning|afternoon|evening|tonight|o'clock)\b"#
+    private static var cal: Calendar { Calendar.current }
+
+    // "tom"/"tod"/"ev" only match lowercase, so names like "call Tom" stay in the title.
+    private static let todayWord = #"(?:today|(?-i:tod))"#
+    private static let tomorrowWord = #"(?:tomorrow|tmrw?|(?-i:tom))"#
+    private static let every = #"(?:every|(?-i:ev))"#
+    private static let weekdayWord = #"(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)s?"#
+    private static let weekdayNumber = ["su": 1, "mo": 2, "tu": 3, "we": 4, "th": 5, "fr": 6, "sa": 7]
+    private static let periodTime = ["morning": (9, 0), "afternoon": (12, 0), "evening": (19, 0), "night": (22, 0)]
 
     static func parse(_ raw: String) -> ParsedReminder {
         var p = ParsedReminder()
@@ -82,52 +132,71 @@ enum Parser {
         }
 
         // Priority
-        if let m = match(#"\s(!{1,3}|p[1-3])(?=\s)"#, in: text), let g = m.groups[0] {
+        if let m = match(#"\s(!{1,3}|p[1-4])(?=\s)"#, in: text), let g = m.groups[0] {
             switch text[g].lowercased() {
             case "!!!", "p1": p.priority = 1
             case "!!", "p2": p.priority = 5
-            default: p.priority = 9
+            case "!", "p3": p.priority = 9
+            default: p.priority = 0  // p4 = no priority (Todoist default)
             }
             text.replaceSubrange(m.whole, with: " ")
         }
 
-        // Repeat (parsed before dates so "every mon" isn't read as a one-off date)
-        if let (rep, range) = parseRepeat(text) {
-            p.repeatRule = rep
-            text.replaceSubrange(range, with: " ")
+        // Repeat (before dates so "every mon" isn't read as a one-off date)
+        var start: Date?
+        if let r = parseRepeat(text) {
+            p.repeatRule = r.rep
+            text.replaceSubrange(r.range, with: r.replacement)
+
+            // for 3 weeks / for 10 times
+            if let m = match(#"\sfor\s+(\d+)\s+(days?|weeks?|months?|times)(?=\s)"#, in: text),
+               let gn = m.groups[0], let gu = m.groups[1], let n = Int(text[gn]) {
+                let unit = text[gu].lowercased()
+                if unit.hasPrefix("time") {
+                    p.repeatRule?.count = n
+                } else {
+                    let c: Calendar.Component = unit.hasPrefix("day") ? .day : unit.hasPrefix("week") ? .weekOfYear : .month
+                    p.repeatRule?.endDate = cal.date(byAdding: c, value: n, to: Date()).map(endOfDay)
+                }
+                text.replaceSubrange(m.whole, with: " ")
+            }
+            // until 31 dec / ending fri
+            if let (d, r) = dateAfter(#"until|ending(?:\s+on)?"#, in: text) {
+                p.repeatRule?.endDate = endOfDay(d)
+                text.replaceSubrange(r, with: " ")
+            }
+            // starting 3 jan / from mon
+            if let (d, r) = dateAfter(#"starting(?:\s+on)?|from"#, in: text) {
+                start = d
+                text.replaceSubrange(r, with: " ")
+            }
         }
 
-        // "in 20 min" / "in 2 hours" / "in 3 days"
-        if let m = match(#"\sin\s+(\d+)\s*(minutes?|mins?|m|hours?|hrs?|h|days?|d)(?=\s)"#, in: text),
-           let gn = m.groups[0], let gu = m.groups[1], let n = Double(text[gn]) {
-            let unit = text[gu].lowercased()
-            let secs: Double = unit.hasPrefix("m") ? 60 : unit.hasPrefix("h") ? 3600 : 86400
-            p.due = Date().addingTimeInterval(n * secs)
+        // Date / time
+        var w = parseWhen(text)
+        text = w.rest
+        if let start { w.day = start }
+        if let exact = w.exact {
+            p.due = exact
             p.hasTime = true
-            text.replaceSubrange(m.whole, with: " ")
-        }
-        // Natural-language dates via NSDataDetector
-        else if let det = detector,
-                let m = det.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
-                let date = m.date, let r = Range(m.range, in: text) {
-            let matched = String(text[r])
-            p.due = date
-            p.hasTime = matched.range(of: timeHint, options: [.regularExpression, .caseInsensitive]) != nil
-            // "3pm" typed after 3pm → assume tomorrow (unless "today" was explicit)
-            if p.hasTime, date < Date(), Date().timeIntervalSince(date) < 86400,
-               matched.range(of: "today", options: .caseInsensitive) == nil {
-                p.due = date.addingTimeInterval(86400)
+        } else if w.day != nil || w.time != nil {
+            var d = cal.startOfDay(for: w.day ?? Date())
+            if let t = w.time {
+                d = cal.date(bySettingHour: t.h, minute: t.m, second: 0, of: d) ?? d
+                // "6pm" after 6pm → tomorrow (Todoist behaviour)
+                if w.day == nil, d < Date() { d = cal.date(byAdding: .day, value: 1, to: d) ?? d }
+                p.hasTime = true
             }
-            text.replaceSubrange(r, with: " ")
+            p.due = d
         }
 
-        // Repeats need a due date: default to today, and snap to the next matching weekday.
+        // Repeats need a due date: default to today, snap to the next matching day.
         if let rep = p.repeatRule {
-            var due = p.due ?? Date()
-            if !rep.weekdays.isEmpty {
-                due = nextMatching(due, weekdays: rep.weekdays)
-                if p.hasTime, due < Date() {
-                    due = nextMatching(due.addingTimeInterval(86400), weekdays: rep.weekdays)
+            var due = p.due ?? cal.startOfDay(for: Date())
+            if !rep.weekdays.isEmpty || !rep.monthDays.isEmpty {
+                due = nextMatching(due, rep)
+                if p.hasTime, due < Date(), let next = cal.date(byAdding: .day, value: 1, to: due) {
+                    due = nextMatching(next, rep)
                 }
             }
             p.due = due
@@ -140,41 +209,204 @@ enum Parser {
         return p
     }
 
-    private static let weekdayWord = #"(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)s?"#
+    // MARK: Dates and times
 
-    private static func parseRepeat(_ text: String) -> (Repeat, Range<String.Index>)? {
-        // daily / every day
-        if let m = match(#"\s(?:daily|every\s+day)(?=\s)"#, in: text) {
-            return (Repeat(frequency: .daily), m.whole)
+    static func parseWhen(_ input: String, useDetector: Bool = true) -> When {
+        var w = When(rest: input)
+        var t = input
+        let now = Date()
+        let today = cal.startOfDay(for: now)
+
+        func take(_ pattern: String) -> (whole: Range<String.Index>, groups: [String?])? {
+            guard let m = match(pattern, in: t) else { return nil }
+            let groups = m.groups.map { $0.map { String(t[$0]).lowercased() } }
+            t.replaceSubrange(m.whole, with: " ")
+            return (m.whole, groups)
         }
-        // every weekday / every weekend
-        if let m = match(#"\severy\s+weekdays?(?=\s)"#, in: text) {
-            return (Repeat(frequency: .weekly, weekdays: [2, 3, 4, 5, 6]), m.whole)
+        func add(_ c: Calendar.Component, _ n: Int, to d: Date) -> Date? { cal.date(byAdding: c, value: n, to: d) }
+
+        // in 20 min / in 2 hours / in 5 days / +3 weeks / in 2 months
+        if let m = take(#"\s(?:in\s+|\+)(\d+)\s*(months?|mos?|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|wks?|w)(?=\s)"#),
+           let ns = m.groups[0], let n = Int(ns), let u = m.groups[1] {
+            if u.hasPrefix("mo") { w.day = add(.month, n, to: today) }
+            else if u.hasPrefix("m") { w.exact = now.addingTimeInterval(Double(n) * 60) }
+            else if u.hasPrefix("h") { w.exact = now.addingTimeInterval(Double(n) * 3600) }
+            else if u.hasPrefix("d") { w.day = add(.day, n, to: today) }
+            else { w.day = add(.weekOfYear, n, to: today) }
         }
-        if let m = match(#"\severy\s+weekends?(?=\s)"#, in: text) {
-            return (Repeat(frequency: .weekly, weekdays: [1, 7]), m.whole)
+
+        // tom morning / tommorning / tod evening …
+        if w.isEmpty, let m = take(#"\s("# + todayWord + "|" + tomorrowWord + #")\s*(morning|afternoon|evening|night)(?=\s)"#),
+           let d = m.groups[0], let per = m.groups[1], let pt = periodTime[per] {
+            w.day = d.hasPrefix("tod") ? today : add(.day, 1, to: today)
+            w.time = (pt.0, pt.1)
         }
-        // every 2 weeks / every other month
-        if let m = match(#"\severy\s+(\d+|other)\s+(days?|weeks?|months?|years?)(?=\s)"#, in: text),
+
+        // Day keywords
+        if w.day == nil, w.exact == nil {
+            if take(#"\s"# + todayWord + #"(?=\s)"#) != nil {
+                w.day = today
+            } else if take(#"\stonight(?=\s)"#) != nil {
+                w.day = today
+                w.time = (22, 0)
+            } else if take(#"\s"# + tomorrowWord + #"(?=\s)"#) != nil {
+                w.day = add(.day, 1, to: today)
+            } else if take(#"\snext\s+week(?=\s)"#) != nil {
+                w.day = nextWeekday(2, includeToday: false)
+            } else if take(#"\snext\s+month(?=\s)"#) != nil {
+                w.day = add(.month, 1, to: today)
+            } else if take(#"\snext\s+year(?=\s)"#) != nil {
+                let y = cal.component(.year, from: today) + 1
+                w.day = cal.date(from: DateComponents(year: y, month: 1, day: 1))
+            } else if let m = take(#"\s(this|next)\s+weekend(?=\s)"#) {
+                let sat = nextWeekday(7, includeToday: true)
+                w.day = m.groups[0] == "next" ? add(.day, 7, to: sat) : sat
+            } else if take(#"\s(?:end\s+of\s+(?:the\s+)?month|eom)(?=\s)"#) != nil {
+                if let first = cal.date(from: cal.dateComponents([.year, .month], from: today)),
+                   let nextMonth = add(.month, 1, to: first) {
+                    w.day = add(.day, -1, to: nextMonth)
+                }
+            } else if let m = take(#"\s(?:on\s+)?(next\s+|this\s+)?("# + weekdayWord + #")(?=\s)"#),
+                      let tok = m.groups[1], let wd = weekdayNumber[String(tok.prefix(2))] {
+                // "fri" = next Friday to occur (today counts); "next fri" = the one after
+                let d = nextWeekday(wd, includeToday: true)
+                w.day = (m.groups[0]?.hasPrefix("next") ?? false) ? add(.day, 7, to: d) : d
+            }
+        }
+
+        // in the morning / this evening
+        if w.time == nil, let m = take(#"\s(?:in\s+the|this)\s+(morning|afternoon|evening|night)(?=\s)"#),
+           let per = m.groups[0], let pt = periodTime[per] {
+            w.time = (pt.0, pt.1)
+        }
+
+        // Explicit times: 3pm, 3:30 pm, 15:00, at 10, noon
+        if w.exact == nil {
+            if let m = take(#"\s(?:at\s+|@)?(\d{1,2})(?::(\d{2}))?\s?(am|pm)(?=\s)"#),
+               let hs = m.groups[0], var h = Int(hs), h >= 1, h <= 12 {
+                let mins = m.groups[1].flatMap { Int($0) } ?? 0
+                if m.groups[2] == "pm", h < 12 { h += 12 }
+                if m.groups[2] == "am", h == 12 { h = 0 }
+                w.time = (h, min(mins, 59))
+            } else if let m = take(#"\s(?:at\s+|@)?([01]?\d|2[0-3]):([0-5]\d)(?=\s)"#),
+                      let h = m.groups[0].flatMap({ Int($0) }), let mins = m.groups[1].flatMap({ Int($0) }) {
+                w.time = (h, mins)
+            } else if let m = take(#"\s(?:at\s+|@)(\d{1,2})(?=\s)"#),
+                      let h = m.groups[0].flatMap({ Int($0) }), h <= 23 {
+                w.time = (h >= 1 && h <= 6 ? h + 12 : h, 0)  // "at 3" → 3pm
+            } else if let m = take(#"\s(?:at\s+)?(noon|midday|midnight)(?=\s)"#) {
+                w.time = m.groups[0] == "midnight" ? (0, 0) : (12, 0)
+            }
+        }
+
+        // Anything else (jan 27, 27/1, 3rd friday jan …) via Apple's date detector
+        if useDetector, w.day == nil, w.exact == nil, let det = detector,
+           let m = det.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)),
+           let date = m.date, let r = Range(m.range, in: t) {
+            let matched = String(t[r])
+            let hasTime = matched.range(of: timeHint, options: [.regularExpression, .caseInsensitive]) != nil
+            if hasTime, w.time == nil {
+                let c = cal.dateComponents([.hour, .minute], from: date)
+                w.time = (c.hour ?? 9, c.minute ?? 0)
+                // time-only match: leave the day empty so "past time → tomorrow" applies
+                if matched.range(of: #"[a-z]{3}|\d+[/.\-]\d+"#, options: [.regularExpression, .caseInsensitive]) != nil,
+                   cal.startOfDay(for: date) != today {
+                    w.day = cal.startOfDay(for: date)
+                }
+            } else {
+                w.day = cal.startOfDay(for: date)
+            }
+            t.replaceSubrange(r, with: " ")
+        }
+
+        w.rest = t
+        return w
+    }
+
+    /// Finds "<keyword> <date>" (date up to 3 words) and returns the date and the range to remove.
+    private static func dateAfter(_ keywords: String, in text: String) -> (Date, Range<String.Index>)? {
+        for n in stride(from: 3, through: 1, by: -1) {
+            let words = #"(\S+"# + String(repeating: #"\s+\S+"#, count: n - 1) + ")"
+            guard let m = match(#"\s(?:"# + keywords + #")\s+"# + words + #"(?=\s)"#, in: text),
+                  let g = m.groups[0] else { continue }
+            let w = parseWhen(" \(text[g]) ")
+            if w.rest.trimmingCharacters(in: .whitespaces).isEmpty, let d = w.exact ?? w.day {
+                return (d, m.whole)
+            }
+        }
+        return nil
+    }
+
+    private static func nextWeekday(_ wd: Int, includeToday: Bool) -> Date {
+        let today = cal.startOfDay(for: Date())
+        for i in (includeToday ? 0 : 1)...7 {
+            if let d = cal.date(byAdding: .day, value: i, to: today), cal.component(.weekday, from: d) == wd { return d }
+        }
+        return today
+    }
+
+    private static func endOfDay(_ d: Date) -> Date {
+        cal.date(bySettingHour: 23, minute: 59, second: 0, of: d) ?? d
+    }
+
+    // MARK: Repeats
+
+    private static func parseRepeat(_ text: String) -> (rep: Repeat, range: Range<String.Index>, replacement: String)? {
+        // every morning / every evening → daily at that time
+        if let m = match(#"\s"# + every + #"\s+(morning|afternoon|evening|night)(?=\s)"#, in: text), let g = m.groups[0] {
+            return (Repeat(frequency: .daily), m.whole, " in the \(text[g]) ")
+        }
+        // daily / everyday / every day
+        if let m = match(#"\s(?:daily|everyday|"# + every + #"\s+day)(?=\s)"#, in: text) {
+            return (Repeat(frequency: .daily), m.whole, " ")
+        }
+        // every weekday / every workday / every weekend
+        if let m = match(#"\s"# + every + #"\s+(?:weekdays?|workdays?)(?=\s)"#, in: text) {
+            return (Repeat(frequency: .weekly, weekdays: [2, 3, 4, 5, 6]), m.whole, " ")
+        }
+        if let m = match(#"\s"# + every + #"\s+weekends?(?=\s)"#, in: text) {
+            return (Repeat(frequency: .weekly, weekdays: [1, 7]), m.whole, " ")
+        }
+        // every 2 weeks / every other month / every 3 quarters
+        if let m = match(#"\s"# + every + #"\s+(\d+|other)\s+(days?|weeks?|months?|quarters?|years?)(?=\s)"#, in: text),
            let gn = m.groups[0], let gu = m.groups[1] {
-            let n = text[gn].lowercased() == "other" ? 2 : max(Int(text[gn]) ?? 1, 1)
-            return (Repeat(frequency: frequency(String(text[gu])), interval: n), m.whole)
+            var n = text[gn].lowercased() == "other" ? 2 : max(Int(text[gn]) ?? 1, 1)
+            let unit = text[gu].lowercased()
+            if unit.hasPrefix("quarter") { n *= 3 }
+            return (Repeat(frequency: frequency(unit), interval: n), m.whole, " ")
+        }
+        // quarterly / every quarter
+        if let m = match(#"\s(?:quarterly|"# + every + #"\s+quarter)(?=\s)"#, in: text) {
+            return (Repeat(frequency: .monthly, interval: 3), m.whole, " ")
         }
         // weekly / monthly / yearly / every week / every month / every year
-        if let m = match(#"\s(?:(weekly|monthly|yearly|annually)|every\s+(week|month|year))(?=\s)"#, in: text) {
+        if let m = match(#"\s(?:(weekly|monthly|yearly|annually)|"# + every + #"\s+(week|month|year))(?=\s)"#, in: text) {
             let word = (m.groups[0] ?? m.groups[1]).map { String(text[$0]) } ?? "week"
-            return (Repeat(frequency: frequency(word)), m.whole)
+            return (Repeat(frequency: frequency(word)), m.whole, " ")
+        }
+        // every last day
+        if let m = match(#"\s"# + every + #"\s+last\s+day(?=\s)"#, in: text) {
+            return (Repeat(frequency: .monthly, monthDays: [-1]), m.whole, " ")
+        }
+        // every 27th / every 2, 15, 27
+        let num = #"\d{1,2}(?:st|nd|rd|th)?"#
+        if let m = match(#"\s"# + every + #"\s+("# + num + #"(?:\s*(?:,|and|&)\s*"# + num + #")*)(?=\s)"#, in: text),
+           let g = m.groups[0] {
+            let days = text[g].components(separatedBy: CharacterSet.decimalDigits.inverted)
+                .compactMap { Int($0) }.filter { (1...31).contains($0) }
+            if !days.isEmpty {
+                return (Repeat(frequency: .monthly, monthDays: Array(Set(days)).sorted()), m.whole, " ")
+            }
         }
         // every mon / every mon, wed and fri
-        let list = #"\severy\s+("# + weekdayWord + #"(?:\s*(?:,|and|&)\s*"# + weekdayWord + #")*)(?=\s)"#
+        let list = #"\s"# + every + #"\s+("# + weekdayWord + #"(?:\s*(?:,|and|&)\s*"# + weekdayWord + #")*)(?=\s)"#
         if let m = match(list, in: text), let g = m.groups[0] {
-            let order = ["su": 1, "mo": 2, "tu": 3, "we": 4, "th": 5, "fr": 6, "sa": 7]
             let days = text[g].lowercased()
                 .components(separatedBy: CharacterSet.letters.inverted)
                 .filter { $0.count >= 3 && $0 != "and" }
-                .compactMap { order[String($0.prefix(2))] }
+                .compactMap { weekdayNumber[String($0.prefix(2))] }
             if !days.isEmpty {
-                return (Repeat(frequency: .weekly, weekdays: Array(Set(days)).sorted()), m.whole)
+                return (Repeat(frequency: .weekly, weekdays: Array(Set(days)).sorted()), m.whole, " ")
             }
         }
         return nil
@@ -183,23 +415,38 @@ enum Parser {
     private static func frequency(_ word: String) -> EKRecurrenceFrequency {
         let w = word.lowercased()
         if w.hasPrefix("day") || w == "daily" { return .daily }
-        if w.hasPrefix("month") { return .monthly }
+        if w.hasPrefix("month") || w.hasPrefix("quarter") { return .monthly }
         if w.hasPrefix("year") || w == "annually" { return .yearly }
         return .weekly
     }
 
-    private static func nextMatching(_ date: Date, weekdays: [Int]) -> Date {
-        let cal = Calendar.current
-        for i in 0..<7 {
-            if let d = cal.date(byAdding: .day, value: i, to: date),
-               weekdays.contains(cal.component(.weekday, from: d)) { return d }
+    private static func nextMatching(_ date: Date, _ rep: Repeat) -> Date {
+        for i in 0..<62 {
+            guard let d = cal.date(byAdding: .day, value: i, to: date) else { continue }
+            if !rep.weekdays.isEmpty {
+                if rep.weekdays.contains(cal.component(.weekday, from: d)) { return d }
+            } else {
+                let day = cal.component(.day, from: d)
+                let last = cal.range(of: .day, in: .month, for: d)?.count ?? 31
+                if rep.monthDays.contains(day) || (rep.monthDays.contains(-1) && day == last) { return d }
+            }
         }
         return date
     }
 
+    private static var regexCache: [String: NSRegularExpression] = [:]
+
+    /// Compiles each pattern once, then reuses it on every keystroke.
+    private static func regex(_ pattern: String) -> NSRegularExpression? {
+        if let re = regexCache[pattern] { return re }
+        let re = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive)
+        regexCache[pattern] = re
+        return re
+    }
+
     private static func match(_ pattern: String, in text: String)
         -> (whole: Range<String.Index>, groups: [Range<String.Index>?])? {
-        guard let re = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+        guard let re = regex(pattern),
               let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
               let whole = Range(m.range, in: text) else { return nil }
         let groups = (1..<max(m.numberOfRanges, 1)).map { Range(m.range(at: $0), in: text) }
@@ -512,7 +759,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             return
         }
         guard !p.title.isEmpty || p.due != nil else {
-            preview.stringValue = "tomorrow 3pm  ·  every mon  ·  #List  ·  !!!  —  ↩ add   ⇧↩ add another   esc close"
+            preview.stringValue = "tom 3pm  ·  ev mon  ·  #List  ·  p1  —  ↩ add   ⇧↩ add another   esc close"
             return
         }
         var parts: [String] = []
